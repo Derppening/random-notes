@@ -1,12 +1,12 @@
 # Mesa RADV Under-The-Hood
 
-This is based on Mesa 23.0.0.
-
 ## Important Information
 
 - [RADV ACO Documentation](https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/amd/compiler/README.md)
 
-## Vulkan's Entry Point
+## Creating a Graphics Pipeline using ACO
+
+### Vulkan's Entry Point
 
 I think the most logical place to start is `vkCreateGraphicsPipelines`, because (at least I presume) the creation of the
 graphics pipeline is where the shaders are actually compiled and linked. If not, the second candidate would be
@@ -20,103 +20,134 @@ to Vulkan function, presumably for all drivers.
 implementation appears to be trivial, only looping over each pipeline and invoking `radv_graphics_pipeline_create` on
 each `VkGraphicsPipelineCreateInfo`. So far, so good.
 
-## `radv_graphics_pipeline_create`
+### `radv_graphics_pipeline_create`
 
-This function is the first RADV-specific function. It appears that this is not the only caller of the function, rather
-other meta-operations would also need to build a pipeline.
+This function is the first RADV-specific function.
 
 First, it recovers an instance of `radv_device*` and `radv_pipeline_cache*` from `VkDevice` and `VkPipelineCache`
 respectively. I am guessing that `VkDevice` and `VkPipelineCache` are just opaque pointers to the actual implementation
 structures.
 
-## ACO's Entry Point
-
-Coming back to this, I think a better way to do this is is to find where shader programs get passed into ACO, and 
-follow its callers to find which Vulkan functions (or its RADV-specific implementations) invoke the compilation 
-process.
-
-With a bit of digging, it appears that the "entry-point" to the ACO compiler is `aco_compile_shader` in 
-`src/amd/compiler/aco_interface.cpp`. Following the callers, we have:
-
-```
-aco_compile_shader [src/amd/compiler/aco_interface.cpp]
-    shader_compile [src/amd/vulkan/radv_shader.c]
+```c
+RADV_FROM_HANDLE(radv_device, device, _device);  
+VK_FROM_HANDLE(vk_pipeline_cache, cache, _cache);
 ```
 
-### `shader_compile`
+Then, a pipeline is allocated using the allocator provided from `vkCreateGraphicsPipeline` (`pAllocator`). `vk_zalloc2` is a Vulkan-common function that zero-allocates an object, similar to `malloc` + `memset(0)`.
 
-After this, we have 3 callers that will invoke the `shader_compile` function:
-
-- `radv_shader_nir_to_asm`
-- `radv_create_gs_copy_shader`
-- `radv_create_trap_handler_shader`
-
-`radv_create_gs_copy_shader` references a type of shader called "GS Copy", which when referring to the RADV ACO
-documentation, is a shader which executes in the *hardware Vertex Shader* stage in GFX6-9 GPUs, in order to copy the
-result of the *software Geometry Shader* from the VRAM to the *hardware Pixel Shader* input.
-
-I am not sure what the Trap Handler Shader is or what it does, but following its callers we have:
-
-```
-radv_trap_handler_init [src/amd/vulkan/radv_debug.c]
-radv_CreateDevice [src/amd/vulkan/radv_device.c]
+```c
+pipeline = vk_zalloc2(&device->vk.alloc, pAllocator, sizeof(*pipeline), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
 ```
 
-The code path which invokes `radv_trap_handler_init` is guarded by a `getenv("RADV_TRAP_HANDLER")` followed by an
-assertion that the GPU is of the GFX8 family. This seems to be just for debugging purposes and currently only
-implemented for the GFX8 family, so we are going to skip this.
+Some fields of the pipeline object is then populated, notably the `vk_object_base` (which is present for all Vulkan objects in Mesa), and `type` (which indicates the type of the pipeline object).
+```c
+struct radv_pipeline {  
+   struct vk_object_base base;
+   enum radv_pipeline_type type;
 
-We will continue to follow the callers of `radv_shader_nir_to_asm` first, then depending on the complexity, we will do
-a deep dive on one of the two interesting code paths first.
+   // ...
+};
 
-Continuing from `radv_shader_nir_to_asm`, we have:
-
-```
-radv_pipeline_nir_to_asm [src/amd/vulkan/radv_pipeline.c]
-radv_create_shaders [src/amd/vulkan/radv_pipeline.c]
+radv_pipeline_init(device, &pipeline->base, RADV_PIPELINE_GRAPHICS);
 ```
 
-And then we have another 5 callers to this function.
+The other fields of the pipeline object is populated from the `VkGraphicsPipelineCreateInfo`. The `vk_graphics_pipeline_create_flags` provides compatibility between core Vulkan and `VK_KHR_maintenance5`. `is_internal`  determines whether the passed-in shader is internal to RADV by checking whether the internal `meta_state` cache is passed in instead of a user-provided cache.
 
-### `radv_create_shaders`
+```c
+pipeline->base.create_flags = vk_graphics_pipeline_create_flags(pCreateInfo);  
+pipeline->base.is_internal = _cache == device->meta_state.cache;
+```
 
-The 5 callers to this function are:
+Finally, control is passed to `radv_graphics_pipeline_init`, and if a failure occurred while initializing the pipeline, the pipeline is destroyed and its status is returned.
 
-- `radv_compute_pipeline_create`
+```c
+result = radv_graphics_pipeline_init(pipeline, device, cache, pCreateInfo, extra);  
+if (result != VK_SUCCESS) {  
+   radv_pipeline_destroy(device, &pipeline->base, pAllocator);  
+   return result;  
+}
+```
 
-  This function appears to create a Vulkan compute pipeline, and is called by `radv_CreateComputePipeline` (which is a
-  function delegate for `vkCreateComputePipeline`).
+#### Sidenote: Meta Shaders
 
-- `radv_graphics_lib_pipeline_init`
+Meta-Shaders appear to be shaders that implement commonly used functionality that are not provided by the hardware. The current list of meta-shaders (as of Mesa 24.0.6) include:
 
-  This function appears to initialize a Vulkan graphics library pipeline. The Vulkan graphics library pipeline is
-  introduced in the `VK_EXT_graphics_pipeline_library` extension, which aims to speed up shader linking. The function is
-  called by `radv_graphics_lib_pipeline_create`, and is in turn called by `radv_CreateGraphicsPipeline` (which is a
-  function delegate for `vkCreateGraphicsPipeline`). This code path is only hit if the
-  `VK_PIPELINE_CREATE_LIBRARY_BIT_KHR` flag is set in the `VkGraphicsPipelineCreateInfo` of the to-be-created pipeline.
+- `astc_decode`
+- `blit`
+- `blit2d`
+- `buffer`
+- `bufimage`
+- `clear`
+- `copy`
+- `copy_vrs_htile`
+- `dcc_retile`
+- `decompress`
+- `etc_decode`
+- `fast_clear`
+- `fmask_copy`
+- `fmask_expand`
+- `resolve`
+- `resolve_cs`
+- `resolve_fs` 
 
-- `radv_graphics_pipeline_init`
+These shaders are generally implemented in NIR and is compiled by LLVM or ACO when these shaders are used, which is why they also contain calls to `radv_graphics_pipeline_create`.
 
-  This function appears to create a Vulkan graphics pipeline, and is called by `radv_graphics_pipeline_create`. This
-  internal function is called by many locations within the code, one of which is `radv_CreateGraphicsPipeline`as
-  expected.
+### `radv_graphics_pipeline_init`
 
-- 2 calls from `radv_rt_pipeline_create`
+This is pretty much the bulk of logic when a graphics pipeline is created. Let's assume that `VK_EXT_graphics_pipeline_library` is not used.
 
-  This function appears to create a Vulkan ray-tracing pipeline. The Vulkan ray-tracing pipelien is introduced in the
-  `VK_KHR_ray_tracing_pipeline` extension, which provides ray-tracing pipeline support. The function is called by
-  `radv_CreateRayTracingPipelineKHR` (which is a function delegate for `vkCreateRayTracingPipelineKHR`).
+First, we need to create and initialize a pipeline layout object to determine how the different stages would need to be pieced together. This layout object appears to only be used within this scope to merge layout information from both the graphics pipeline library (GPL) and the current invocation of `vkCreateGraphicsPipeline`.
 
-  The reason why there are two calls to `radv_create_shaders` is mentioned in the comment:
+```c
+struct radv_pipeline_layout pipeline_layout;
+radv_pipeline_layout_init(device, &pipeline_layout, false);
+```
 
-  ```c
-     /* First check if we can get things from the cache before we take the expensive step of
-      * generating the nir. */
-  ```
+The pipeline layout information would be imported first from the GPL, then from our current `pCreateInfo` struct.
 
-  The first call to `radv_create_shaders` passes an additional flag of
-  `VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT` to get and return a cached version of the pipeline if it
-  exists. If the cached version does not exist, the second call is used to perform the actual compilation of the shader.
+```c
+/* If we have libraries, import them first. */  
+if (libs_info) {    
+      radv_graphics_pipeline_import_lib(...);
+   }  
+}  
+  
+/* Import graphics pipeline info that was not included in the libraries. */  
+result = radv_pipeline_import_graphics_info(device, pipeline, &state, &pipeline_layout, pCreateInfo, needed_lib_flags);
+if (result != VK_SUCCESS) {
+   radv_pipeline_layout_finish(device, &pipeline_layout);
+   return result;
+}
+```
+
+Diving into `radv_pipeline_import_graphics_info`... First step seem pretty self-explanatory, setting internal dynamic states (from `VK_KHR_dynamic_rendering`) as they are.
+
+```c
+/* Mark all states declared dynamic at pipeline creation. */  
+if (pCreateInfo->pDynamicState) {  
+   uint32_t count = pCreateInfo->pDynamicState->dynamicStateCount;  
+   for (uint32_t s = 0; s < count; s++) {  
+      pipeline->dynamic_states |= radv_dynamic_state_mask(pCreateInfo->pDynamicState->pDynamicStates[s]);  
+   }  
+}
+```
+
+Next, set the active stages of the pipeline based on `pCreateInfo`, ignoring any that have already been set by the GPL.
+
+```c
+/* Mark all active stages at pipeline creation. */  
+for (uint32_t i = 0; i < pCreateInfo->stageCount; i++) {  
+   const VkPipelineShaderStageCreateInfo *sinfo = &pCreateInfo->pStages[i];  
+  
+   /* Ignore shader stages that don't need to be imported. */  
+   if (!(shader_stage_to_pipeline_library_flags(sinfo->stage) & lib_flags))  
+      continue;  
+  
+   pipeline->active_stages |= sinfo->stage;  
+}
+```
+
+
 
 ## Appendix
 
